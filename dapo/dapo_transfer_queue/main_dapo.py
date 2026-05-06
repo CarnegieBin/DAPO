@@ -13,7 +13,7 @@
 # limitations under the License.
 """
 DAPO with TransferQueue: main entry sets TRANSFER_QUEUE_ENABLE and uses
-RayDAPOTrainer (extends recipe.transfer_queue.ray_trainer.RayPPOTrainer).
+RayDAPOTrainer (extends transfer_queue.ray_trainer.RayPPOTrainer).
 """
 
 import os
@@ -107,7 +107,7 @@ class TaskRunner:
         else:
             raise NotImplementedError
 
-        from recipe.transfer_queue.ray_trainer import ResourcePoolManager
+        from transfer_queue.ray_trainer import ResourcePoolManager
 
         role_worker_mapping = {
             Role.ActorRollout: ray.remote(AsyncActorRolloutRefWorker),

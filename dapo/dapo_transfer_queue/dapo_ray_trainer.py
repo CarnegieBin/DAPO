@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-DAPO Trainer with TransferQueue: extends recipe.transfer_queue.ray_trainer.RayPPOTrainer,
+DAPO Trainer with TransferQueue: extends transfer_queue.ray_trainer.RayPPOTrainer,
 overrides fit() and compute_kl_related_metrics() to use BatchMeta/tq_client and DAPO logic
 (dynamic sampling, filter_groups, etc.).
 """
@@ -25,7 +25,7 @@ from pprint import pprint
 import numpy as np
 import torch
 from omegaconf import OmegaConf
-from recipe.transfer_queue.ray_trainer import (
+from transfer_queue.ray_trainer import (
     AdvantageEstimator,
     RayPPOTrainer,
     apply_kl_penalty,
