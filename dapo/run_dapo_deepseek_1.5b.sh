@@ -38,10 +38,14 @@ NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_HOME="/home/work/tcbian/ExpThink/data"
 MODEL_PATH=${MODEL_PATH:-"/ssd2/llm_models/DeepSeek-R1-Distill-Qwen-1.5B"}
-CKPTS_DIR=${CKPTS_DIR:-"${SCRIPT_DIR}/ckpts/${project_name}/${exp_name}"}
+CKPTS_DIR=${CKPTS_DIR:-"/ssd1/tcbian/DAPO/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILE="${DATA_HOME}/deepscaler.parquet"
 # Multiple val files: aime_16, amc_8, math, minerva, olympiad
 VAL_FILES="[${DATA_HOME}/aime_16.parquet,${DATA_HOME}/amc_8.parquet,${DATA_HOME}/math.parquet,${DATA_HOME}/minerva.parquet,${DATA_HOME}/olympiad.parquet]"
+
+# Logging
+LOG_FILE="$(pwd)/${project_name}-${exp_name}.log"
+echo "Logging to: ${LOG_FILE}"
 
 # Algorithm
 temperature=1.0
@@ -131,4 +135,4 @@ python3 -m dapo.main_dapo \
     trainer.save_freq=10 \
     trainer.total_epochs=15 \
     trainer.default_local_dir="${CKPTS_DIR}" \
-    trainer.resume_mode=auto
+    trainer.resume_mode=auto 2>&1 | tee "${LOG_FILE}"

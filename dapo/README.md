@@ -194,3 +194,48 @@ We strongly recommend to only modify one thing at a time.
 We also list some known problems here:
 
 1. Enabling CUDA graph (`enforce_eager=False`) might cause model performance degradation, whose cause is still under investigation.
+
+## Docker 环境配置
+
+### 使用已有镜像启动容器（含目录挂载）
+
+以下步骤适用于在服务器上重建容器并挂载本地代码目录：
+
+**第一步：停止并删除旧容器**
+
+```bash
+docker stop verl && docker rm verl
+```
+
+**第二步：重建容器，挂载 DAPO 目录**
+
+```bash
+docker create --runtime=nvidia --gpus all --net=host --shm-size="10g" \
+  --cap-add=SYS_ADMIN \
+  -v /home/work/tcbian/DAPO:/workspace/DAPO \
+  --name verl \
+  verlai/verl:vllm011.latest \
+  sleep infinity
+```
+
+**第三步：启动并进入容器**
+
+```bash
+docker start verl
+docker exec -it verl bash
+```
+
+**验证挂载成功**
+
+```bash
+ls /workspace/DAPO
+```
+
+### 说明
+
+- `-v /home/work/tcbian/DAPO:/workspace/DAPO`：将主机目录挂载到容器内，文件实时同步。
+- `--shm-size="10g"`：共享内存大小，训练时建议不低于 10g。
+- 若只需一次性复制文件（无需同步），可用 `docker cp` 替代挂载：
+  ```bash
+  docker cp /home/work/tcbian/DAPO verl:/workspace/DAPO
+  ```
