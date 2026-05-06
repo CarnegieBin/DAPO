@@ -15,7 +15,7 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 8))
+max_response_length=$((1024 * 16))   # 16384
 enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 4))
 overlong_penalty_factor=1.0
@@ -25,19 +25,20 @@ loss_agg_mode="token-mean"
 enable_filter_groups=True
 filter_groups_metric=acc
 max_num_gen_batches=10
-train_prompt_bsz=128
-gen_prompt_bsz=$((train_prompt_bsz * 3))
-n_resp_per_prompt=8
-train_prompt_mini_bsz=16
+train_prompt_bsz=512
+gen_prompt_bsz=$((256 * 3))          # 768
+n_resp_per_prompt=16
+train_prompt_mini_bsz=128
 
 # Hardware
 NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
 # Paths
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_HOME="/home/work/tcbian/ExpThink/data"
 MODEL_PATH=${MODEL_PATH:-"/ssd2/llm_models/DeepSeek-R1-Distill-Qwen-1.5B"}
-CKPTS_DIR=${CKPTS_DIR:-"/home/work/tcbian/ExpThink/ckpts/${project_name}/${exp_name}"}
+CKPTS_DIR=${CKPTS_DIR:-"${SCRIPT_DIR}/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILE="${DATA_HOME}/deepscaler.parquet"
 # Multiple val files: aime_16, amc_8, math, minerva, olympiad
 VAL_FILES="[${DATA_HOME}/aime_16.parquet,${DATA_HOME}/amc_8.parquet,${DATA_HOME}/math.parquet,${DATA_HOME}/minerva.parquet,${DATA_HOME}/olympiad.parquet]"
@@ -45,10 +46,13 @@ VAL_FILES="[${DATA_HOME}/aime_16.parquet,${DATA_HOME}/amc_8.parquet,${DATA_HOME}
 # Algorithm
 temperature=1.0
 top_p=1.0
-top_k=-1 # -1 for vLLM rollout
-val_top_p=0.7
+top_k=-1        # -1 for vLLM rollout (default)
+val_temperature=0.6
+val_top_p=0.95
+val_top_k=-1    # default
 
 # Performance: 1.5B model fits comfortably on single GPU, no need for parallelism or offload
+# max trajectory length per GPU = max_prompt_length + max_response_length = 2048 + 16384 = 18432
 sp_size=1
 gen_tp=1
 use_dynamic_bsz=True
@@ -105,9 +109,9 @@ python3 -m dapo.main_dapo \
     actor_rollout_ref.rollout.temperature=${temperature} \
     actor_rollout_ref.rollout.top_p=${top_p} \
     actor_rollout_ref.rollout.top_k="${top_k}" \
-    actor_rollout_ref.rollout.val_kwargs.temperature=${temperature} \
+    actor_rollout_ref.rollout.val_kwargs.temperature=${val_temperature} \
     actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
-    actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
+    actor_rollout_ref.rollout.val_kwargs.top_k=${val_top_k} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
@@ -117,7 +121,7 @@ python3 -m dapo.main_dapo \
     +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
     +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
-    trainer.logger='["console"]' \
+    trainer.logger='["console","swanlab"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.n_gpus_per_node=${NGPUS_PER_NODE} \
@@ -125,6 +129,6 @@ python3 -m dapo.main_dapo \
     trainer.val_before_train=True \
     trainer.test_freq=10 \
     trainer.save_freq=10 \
-    trainer.total_epochs=3 \
+    trainer.total_epochs=15 \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.resume_mode=auto
