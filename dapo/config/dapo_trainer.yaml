@@ -14,11 +14,11 @@ reward:
     name: dapo
   reward_kwargs:
     overlong_buffer_cfg:
-      enable: False # We try to avoid forgetting to set enable
-      len: 0
-      penalty_factor: 0.0
-      log: False
-    max_resp_len: null
+      enable: True        # Soft Overlong Punishment (DAPO paper Sec 3.4)
+      len: 4096           # Lcache: soft penalty buffer window (tokens)
+      penalty_factor: 1.0 # Linear penalty slope
+      log: True
+    max_resp_len: 16384   # Lmax: expected max response length (tokens)
 
 algorithm:
   filter_groups:

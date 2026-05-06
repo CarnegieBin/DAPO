@@ -15,9 +15,10 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 16))   # 16384
+overlong_buffer_len=$((1024 * 4))    # Lcache = 4096 (soft penalty buffer)
+max_resp_len=$((1024 * 16))          # Lmax   = 16384 (penalty starts at Lmax - Lcache = 12288)
+max_response_length=$((max_resp_len + overlong_buffer_len))  # actual vLLM cap = 20480
 enable_overlong_buffer=True
-overlong_buffer_len=$((1024 * 4))
 overlong_penalty_factor=1.0
 
 loss_agg_mode="token-mean"
@@ -42,6 +43,8 @@ CKPTS_DIR=${CKPTS_DIR:-"/ssd1/tcbian/DAPO/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILE="${DATA_HOME}/deepscaler.parquet"
 # Multiple val files: aime_16, amc_8, math, minerva, olympiad
 VAL_FILES="[${DATA_HOME}/aime_16.parquet,${DATA_HOME}/amc_8.parquet,${DATA_HOME}/math.parquet,${DATA_HOME}/minerva.parquet,${DATA_HOME}/olympiad.parquet]"
+# VAL_FILES="[${DATA_HOME}/aime_16.parquet]"
+
 
 # Logging
 LOG_FILE="$(pwd)/${project_name}-${exp_name}.log"
@@ -118,13 +121,14 @@ python3 -m dapo.main_dapo \
     actor_rollout_ref.rollout.val_kwargs.top_k=${val_top_k} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
+    actor_rollout_ref.rollout.val_kwargs.max_tokens=16384 \
     actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
-    +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
+    reward.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
+    reward.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
+    reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
+    reward.reward_kwargs.overlong_buffer_cfg.log=True \
+    reward.reward_kwargs.max_resp_len=${max_resp_len} \
     trainer.logger='["console","swanlab"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
