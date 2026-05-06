@@ -46,6 +46,13 @@ from verl.utils.profiler import marked_timer
 from verl.utils.rollout_skip import RolloutSkip
 
 
+def _json_default(obj):
+    """JSON serializer for numpy scalars and other non-serializable types."""
+    if isinstance(obj, np.generic):
+        return obj.item()
+    raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
+
 class RayDAPOTrainer(RayPPOTrainer):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
@@ -105,7 +112,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 for k, v in extra.items():
                     vals = v if isinstance(v, (list, np.ndarray)) else []
                     record[k] = vals[i] if i < len(vals) else None
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                f.write(json.dumps(record, ensure_ascii=False, default=_json_default) + "\n")
         print(f"[TrajectoryLog] Saved {len(inputs)} trajectories → {out_path}")
 
     def _save_checkpoint(self):
@@ -255,24 +262,18 @@ class RayDAPOTrainer(RayPPOTrainer):
         sample_scores = []
         sample_response_lengths = []
 
+        from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
             test_batch = test_batch.repeat(
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
 
-            if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
+            if self.config.reward.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
                 return {}
 
-            # Decode inputs
-            input_ids = test_batch.batch["input_ids"]
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
-
-            test_gen_batch = test_batch.pop(
-                batch_keys=["input_ids", "attention_mask", "position_ids"],
-                non_tensor_batch_keys=["raw_prompt_ids"],
-            )
+            test_gen_batch = self._get_gen_batch(test_batch)
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
@@ -281,11 +282,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                 "validate": True,
             }
 
-            from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(
-                test_gen_batch, self.actor_rollout_wg.world_size
-            )
-            test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+            size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
+            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+            test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
 
             # Decode outputs
@@ -305,15 +304,18 @@ class RayDAPOTrainer(RayPPOTrainer):
 
             test_batch = test_batch.union(test_output_gen_batch)
 
-            result = self.val_reward_fn(test_batch, return_dict=True)
-            reward_tensor = result["reward_tensor"]
+            # Decode inputs (prompts available after generation)
+            input_ids = test_batch.batch["prompts"]
+            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            sample_inputs.extend(input_texts)
+
+            reward_tensor, reward_extra_info = extract_reward(test_batch)
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
 
             reward_extra_infos_dict["reward"].extend(scores)
-            if "reward_extra_info" in result:
-                for key, lst in result["reward_extra_info"].items():
-                    reward_extra_infos_dict[key].extend(lst)
+            for key, lst in reward_extra_info.items():
+                reward_extra_infos_dict[key].extend(lst)
 
             data_source_lst.append(
                 test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0])
@@ -363,6 +365,7 @@ class RayDAPOTrainer(RayPPOTrainer):
             n = n_values[0] if n_values else 1
 
             per_question_mean_acc = []
+            per_question_acc_var = []
             pass_k_accum: dict[int, list] = defaultdict(list)
 
             ks = []
@@ -375,7 +378,10 @@ class RayDAPOTrainer(RayPPOTrainer):
                 n_q = len(scores)
                 correct = [1 if s > 0 else 0 for s in scores]
                 c = sum(correct)
-                per_question_mean_acc.append(np.mean(correct))
+                p = float(np.mean(correct))
+                per_question_mean_acc.append(p)
+                # within-question variance: p*(1-p), meaningful only when n > 1
+                per_question_acc_var.append(p * (1.0 - p))
                 for ki in ks:
                     if ki <= n_q:
                         pass_k_accum[ki].append(_pass_at_k(n_q, c, ki))
@@ -383,12 +389,21 @@ class RayDAPOTrainer(RayPPOTrainer):
             all_lengths = [l for lengths in prompt2lengths.values() for l in lengths]
             length_mean = float(np.mean(all_lengths)) if all_lengths else 0.0
             mean_acc = float(np.mean(per_question_mean_acc)) if per_question_mean_acc else 0.0
+            # within-question acc variance averaged over all questions
+            acc_var_within = float(np.mean(per_question_acc_var)) if per_question_acc_var else 0.0
+            # cross-question acc variance: spread of difficulty across questions
+            acc_var_across = float(np.var(per_question_mean_acc)) if len(per_question_mean_acc) > 1 else 0.0
 
-            print(f"[val] data_source={ds}, n={n}, mean_acc={mean_acc:.4f}, length_mean={length_mean:.1f}")
+            print(f"[val] data_source={ds}, n={n}, mean_acc={mean_acc:.4f}, "
+                  f"acc_var_within={acc_var_within:.4f}, acc_var_across={acc_var_across:.4f}, "
+                  f"length_mean={length_mean:.1f}")
             for ki in ks:
                 pass_k_val = float(np.mean(pass_k_accum[ki])) if pass_k_accum[ki] else 0.0
                 print(f"  pass@{ki}={pass_k_val:.4f}")
                 metric_dict[f"val-core/{ds}/pass_k/pass@{ki}"] = pass_k_val
+            metric_dict[f"val-core/{ds}/mean_acc"] = mean_acc
+            metric_dict[f"val-core/{ds}/acc_var/within_question"] = acc_var_within
+            metric_dict[f"val-core/{ds}/acc_var/across_question"] = acc_var_across
             metric_dict[f"val-core/{ds}/response_length/mean"] = length_mean
 
         return metric_dict
