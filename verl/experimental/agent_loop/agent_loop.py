@@ -872,12 +872,11 @@ class AgentLoopWorker:
 
         non_tensor_batch.update(extra_fields)
 
-        # Only include reward_extra_keys in meta_info if rm_scores is in batch
-        # This avoids conflicts when reward_tensor is merged later in ray_trainer.py
-        if "rm_scores" in batch.keys():
-            meta_info = {"metrics": metrics, "reward_extra_keys": reward_extra_keys}
-        else:
-            meta_info = {"metrics": metrics}
+        # Always include reward_extra_keys so that validation paths (where rm_scores
+        # is computed outside agent_loop) can still read acc/reward from non_tensor_batch
+        # via extract_reward().  When rm_scores *is* present the keys are needed for the
+        # same reason; there is no conflict because non_tensor_batch already contains them.
+        meta_info = {"metrics": metrics, "reward_extra_keys": reward_extra_keys}
 
         return DataProto(
             batch=batch,
