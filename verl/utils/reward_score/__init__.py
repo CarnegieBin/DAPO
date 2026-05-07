@@ -56,14 +56,10 @@ def default_compute_score(
 
         # from . import math_verify
         # res = math_verify.compute_score(solution_str, ground_truth)
-    elif data_source in [
-        "math_dapo", "math", "math_dapo_reasoning",
-        "minerva", "olympiad", "amc_8", "amc",
-        "math500",
-    ] or data_source.startswith("aime") or data_source.startswith("amc"):
-        from dapo.custom_think_rm import verify_think_rm
+    elif data_source in ["math_dapo", "math", "math_dapo_reasoning"] or data_source.startswith("aime"):
+        from . import math_dapo
 
-        res = verify_think_rm(data_source, solution_str, ground_truth, extra_info)
+        res = math_dapo.compute_score(solution_str, ground_truth)
     elif data_source in [
         "numina_aops_forum",
         "numina_synthetic_math",
@@ -108,9 +104,7 @@ def default_compute_score(
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
 
     else:
-        from dapo.custom_think_rm import verify_think_rm
-
-        res = verify_think_rm(data_source, solution_str, ground_truth, extra_info)
+        raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 
     if isinstance(res, dict):
         return res

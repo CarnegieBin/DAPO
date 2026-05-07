@@ -181,11 +181,7 @@ def is_correct_minerva(
     extracted_answer = match[-1] if match else "[INVALID]"
     pred = normalize_final_answer(extracted_answer)
 
-    # Process ground truth — may be a list of acceptable answers
-    if isinstance(gt, list):
-        gt_normalized = [normalize_final_answer(str(g)) for g in gt]
-        return (pred in gt_normalized), pred
-
+    # Process ground truth
     if gt_need_extract:
         gt = normalize_final_answer(remove_boxed(last_boxed_only_string(gt)))
     else:
@@ -218,8 +214,6 @@ def is_correct_strict_box(
     boxed_pred = last_boxed_only_string(pred)
     extracted_pred = remove_boxed(boxed_pred) if boxed_pred is not None else None
 
-    if isinstance(gt, list):
-        return 1 if (extracted_pred in gt) else -1, extracted_pred
     return 1 if (extracted_pred == gt) else -1, extracted_pred
 
 
