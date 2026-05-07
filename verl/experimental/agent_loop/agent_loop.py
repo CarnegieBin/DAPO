@@ -537,18 +537,11 @@ class AgentLoopWorker:
         #   e.g., [0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,0,0,0]
 
         # TODO(wuxibin): remove padding and use tensordict.
-        # Left-truncate prompt if it exceeds the configured prompt_length. Without this,
-        # samples whose tokenized prompt is longer than prompt_length produce tensors with
-        # a different dim-1 size, causing torch.cat to fail in _postprocess.
-        max_prompt_len = self.rollout_config.prompt_length
-        if len(output.prompt_ids) > max_prompt_len:
-            output.prompt_ids = output.prompt_ids[-max_prompt_len:]
-
         self.tokenizer.padding_side = "left"
         prompt_output = self.tokenizer.pad(
             {"input_ids": output.prompt_ids},
             padding="max_length",
-            max_length=max_prompt_len,
+            max_length=self.rollout_config.prompt_length,
             return_tensors="pt",
             return_attention_mask=True,
         )
