@@ -72,6 +72,7 @@ python3 -m dapo.main_dapo \
     data.val_files="${VAL_FILES}" \
     data.prompt_key=prompt \
     data.truncation='left' \
+    data.filter_overlong_prompts=True \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.gen_batch_size=${gen_prompt_bsz} \
