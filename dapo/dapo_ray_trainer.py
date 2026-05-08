@@ -20,6 +20,7 @@ import glob as glob_module
 import json
 import os
 import shutil
+import time
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -180,9 +181,6 @@ class RayDAPOTrainer(RayPPOTrainer):
         )
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
-
-        # Save HF-format checkpoint for the current step
-        self.actor_rollout_wg.save_hf_checkpoint(actor_local_path)
 
         # ---- Clean up old checkpoints: keep only HF weights ----
         for ckpt_dir in glob_module.glob(
@@ -480,6 +478,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
 
+                _step_start_ts = time.time()
+                print(f"[FIT] === step={self.global_steps} epoch={epoch} | loop-top reached ===", flush=True)
+
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
                         not prev_step_profile and curr_step_profile
@@ -500,9 +501,13 @@ class RayDAPOTrainer(RayPPOTrainer):
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, "red"):
+                        print(f"[FIT] step={self.global_steps} gen_batch={num_gen_batches} | "
+                              f"calling generate_sequences ...", flush=True)
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                        print(f"[FIT] step={self.global_steps} gen_batch={num_gen_batches} | "
+                              f"generate_sequences done, elapsed={time.time()-_step_start_ts:.1f}s", flush=True)
 
                     # Decode training inputs/outputs now; scores appended after reward computation
                     try:
@@ -558,6 +563,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                         # otherwise, we will compute those after dynamic sampling
 
                     with marked_timer("reward", timing_raw, "yellow"):
+                        print(f"[FIT] step={self.global_steps} gen_batch={num_gen_batches} | "
+                              f"computing reward ...", flush=True)
                         # compute scores. Support both model and function-based.
                         # We first compute the scores using reward model. Then, we call reward_fn to combine
                         # the results from reward model and rule-based results.
@@ -711,6 +718,8 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                         prompt_bsz = self.config.data.train_batch_size
                         if num_prompt_in_batch < prompt_bsz:
+                            print(f"[FIT] step={self.global_steps} gen_batch={num_gen_batches} | "
+                                  f"{num_prompt_in_batch=} < {prompt_bsz=}, need more generations", flush=True)
                             print(f"{num_prompt_in_batch=} < {prompt_bsz=}")
                             max_num_gen_batches = self.config.algorithm.filter_groups.max_num_gen_batches
                             if max_num_gen_batches <= 0 or num_gen_batches < max_num_gen_batches:
@@ -752,7 +761,10 @@ class RayDAPOTrainer(RayPPOTrainer):
                             print(f"[TrajectoryLog] Warning: failed to flush train trajectories at step "
                                   f"{self.global_steps}: {_e}")
 
+                    print(f"[FIT] step={self.global_steps} | calling sleep_replicas ...", flush=True)
                     self.checkpoint_manager.sleep_replicas()
+                    print(f"[FIT] step={self.global_steps} | sleep_replicas done, "
+                          f"elapsed={time.time()-_step_start_ts:.1f}s", flush=True)
 
                     # === Updating ===
                     # Balance the number of valid tokens across DP ranks.
@@ -767,7 +779,10 @@ class RayDAPOTrainer(RayPPOTrainer):
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
                     if not self.config.algorithm.use_kl_in_reward:
+                        print(f"[FIT] step={self.global_steps} | computing kl_related_metrics ...", flush=True)
                         batch = self.compute_kl_related_metrics(batch, metrics, timing_raw)
+                        print(f"[FIT] step={self.global_steps} | kl_related_metrics done, "
+                              f"elapsed={time.time()-_step_start_ts:.1f}s", flush=True)
 
                     # compute values
                     if self.use_critic:
@@ -808,7 +823,10 @@ class RayDAPOTrainer(RayPPOTrainer):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, "red"):
+                            print(f"[FIT] step={self.global_steps} | calling update_actor ...", flush=True)
                             actor_output = self._update_actor(batch)
+                            print(f"[FIT] step={self.global_steps} | update_actor done, "
+                                  f"elapsed={time.time()-_step_start_ts:.1f}s", flush=True)
 
                         # Check if ESI/training plan is close to expiration
                         esi_close_to_expiration = should_save_ckpt_esi(
@@ -826,7 +844,10 @@ class RayDAPOTrainer(RayPPOTrainer):
                                 self._save_checkpoint()
 
                         with marked_timer("update_weights", timing_raw, "red"):
+                            print(f"[FIT] step={self.global_steps} | calling update_weights ...", flush=True)
                             self.checkpoint_manager.update_weights()
+                            print(f"[FIT] step={self.global_steps} | update_weights done, "
+                                  f"elapsed={time.time()-_step_start_ts:.1f}s", flush=True)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
@@ -840,7 +861,10 @@ class RayDAPOTrainer(RayPPOTrainer):
                     is_last_step or self.global_steps % self.config.trainer.test_freq == 0
                 ):
                     with marked_timer("testing", timing_raw, "green"):
+                        print(f"[FIT] step={self.global_steps} | starting validation ...", flush=True)
                         val_metrics: dict = self._validate()
+                        print(f"[FIT] step={self.global_steps} | validation done, "
+                              f"elapsed={time.time()-_step_start_ts:.1f}s", flush=True)
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
