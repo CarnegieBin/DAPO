@@ -220,6 +220,75 @@ class RayDAPOTrainer(RayPPOTrainer):
                     except Exception as e:
                         print(f"Failed to remove {item_path}: {e}")
 
+    def _record_and_prune_checkpoints(self, val_metrics: dict, keep_best: int = 3):
+        """Keep only the best `keep_best` checkpoints (ranked by AIME pass@1) plus the
+        current step's checkpoint; delete all others entirely.
+
+        Called after validation so the current step's pass@1 is available. The metric
+        history is persisted to `checkpoint_metrics.json` under default_local_dir so
+        rankings survive a resume.
+        """
+        ckpt_root = self.config.trainer.default_local_dir
+        cur_step = self.global_steps
+        cur_dir = os.path.join(ckpt_root, f"global_step_{cur_step}")
+        if not os.path.isdir(cur_dir):
+            return  # no checkpoint saved this step, nothing to prune
+
+        # Extract AIME pass@1 from val metrics (data_source containing "aime").
+        aime_score = None
+        for k, v in val_metrics.items():
+            kl = k.lower()
+            if kl.startswith("val-core/") and "aime" in kl and kl.endswith("/pass_k/pass@1"):
+                aime_score = float(v)
+                break
+        if aime_score is None:
+            print("[CkptPrune] No AIME pass@1 found in val metrics; skipping prune this step.")
+            return
+
+        hist_path = os.path.join(ckpt_root, "checkpoint_metrics.json")
+        history = {}
+        if os.path.exists(hist_path):
+            try:
+                with open(hist_path) as f:
+                    history = json.load(f)
+            except Exception:
+                history = {}
+        history[str(cur_step)] = aime_score
+
+        # Collect existing checkpoint steps on disk.
+        existing_steps = []
+        for d in glob_module.glob(os.path.join(ckpt_root, "global_step_*")):
+            if not os.path.isdir(d):
+                continue
+            try:
+                existing_steps.append(int(os.path.basename(d).replace("global_step_", "")))
+            except ValueError:
+                continue
+
+        # Keep the top `keep_best` by AIME pass@1, plus the current step.
+        ranked = sorted(existing_steps, key=lambda s: history.get(str(s), float("-inf")), reverse=True)
+        keep = set(ranked[:keep_best])
+        keep.add(cur_step)
+
+        for s in existing_steps:
+            if s in keep:
+                continue
+            d = os.path.join(ckpt_root, f"global_step_{s}")
+            try:
+                shutil.rmtree(d)
+                print(f"[CkptPrune] Removed checkpoint not in best-{keep_best}+current: {d}")
+            except Exception as e:
+                print(f"[CkptPrune] Failed to remove {d}: {e}")
+
+        history = {s: sc for s, sc in history.items() if int(s) in keep}
+        with open(hist_path, "w") as f:
+            json.dump(history, f, indent=2)
+        print(
+            f"[CkptPrune] Kept {sorted(keep)} "
+            f"(best-{keep_best} by AIME pass@1 + current step {cur_step}); "
+            f"current pass@1={aime_score:.4f}"
+        )
+
     def compute_kl_related_metrics(self, batch: DataProto, metrics: dict, timing_raw: dict):
         batch.batch["response_mask"] = compute_response_mask(batch)
 
@@ -868,6 +937,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
+
+                    # Keep only the best-3 checkpoints by AIME pass@1 plus the current one.
+                    self._record_and_prune_checkpoints(val_metrics, keep_best=3)
 
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (

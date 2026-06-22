@@ -215,7 +215,7 @@ class AutomodelOptimizerConfig(OptimizerConfig):
         return super().__post_init__()
 
 
-def build_optimizer(parameters, config: FSDPOptimizerConfig):
+def build_optimizer(parameters, config: FSDPOptimizerConfig, module=None):
     """Build an optimizer based on the configuration.
 
     Dynamically imports and instantiates an optimizer class from the specified module.
@@ -223,6 +223,7 @@ def build_optimizer(parameters, config: FSDPOptimizerConfig):
     Args:
         parameters: Model parameters to optimize
         config: FSDPOptimizerConfig with optimizer settings
+        module: Optional model module (needed for optimizers that require named_parameters, e.g. Muon)
 
     Returns:
         Optimizer instance
@@ -240,7 +241,29 @@ def build_optimizer(parameters, config: FSDPOptimizerConfig):
         # BitsAndBytes AdamW 8bit
         config.optimizer_impl = "bitsandbytes.optim"
         config.optimizer = "AdamW8bit"
+
+        # Muon (requires module for named_parameters access)
+        config.optimizer_impl = "dapo.muon"
+        config.optimizer = "Muon"
     """
+    if config.optimizer == "Muon":
+        from dapo.muon import Muon
+
+        assert module is not None, "Muon optimizer requires module for named_parameters access"
+        muon_params = [
+            p for name, p in module.named_parameters()
+            if p.ndim >= 2 and "embed_tokens" not in name and "lm_head" not in name
+        ]
+        adamw_params = [
+            p for name, p in module.named_parameters()
+            if not (p.ndim >= 2 and "embed_tokens" not in name and "lm_head" not in name)
+        ]
+        return Muon(
+            lr=config.lr,
+            wd=config.weight_decay,
+            muon_params=muon_params,
+            adamw_params=adamw_params,
+        )
     import importlib
 
     optimizer_args = {

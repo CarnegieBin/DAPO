@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='DAPO'
-exp_name='DAPO-DeepSeek-R1-Distill-Qwen-1.5B'
+exp_name='DAPO-DeepSeek-R1-Distill-Qwen-7B'
 
 adv_estimator=grpo
 
@@ -38,7 +38,7 @@ NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_HOME="/home/work/tcbian/ExpThink/data"
-MODEL_PATH=${MODEL_PATH:-"/ssd2/llm_models/DeepSeek-R1-Distill-Qwen-1.5B"}
+MODEL_PATH=${MODEL_PATH:-"/ssd2/llm_models/DeepSeek-R1-Distill-Qwen-7B"}
 CKPTS_DIR=${CKPTS_DIR:-"/ssd1/tcbian/DAPO/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILE="${DATA_HOME}/deepscaler.parquet"
 # Multiple val files: aime_16, amc_8, math, minerva, olympiad
@@ -58,7 +58,7 @@ val_temperature=0.6
 val_top_p=0.95
 val_top_k=-1    # default
 
-# Performance: 1.5B model fits comfortably on single GPU, no need for parallelism or offload
+# Performance: 7B model. Single GPU per rank still fits with gradient checkpointing.
 # max trajectory length per GPU = max_prompt_length + max_response_length = 2048 + 16384 = 18432
 sp_size=1
 gen_tp=1
@@ -98,6 +98,8 @@ python3 -m dapo.main_dapo \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.actor.checkpoint.save_contents=[model,hf_model] \
+    actor_rollout_ref.actor.checkpoint.load_contents=[model] \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
