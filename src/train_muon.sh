@@ -63,7 +63,7 @@ actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
 infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
 offload=False
 
-python3 -m dapo.main_dapo \
+python3 -m src.main_dapo \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${VAL_FILES}" \
     data.prompt_key=prompt \
@@ -95,7 +95,7 @@ python3 -m dapo.main_dapo \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.optimizer=Muon \
-    actor_rollout_ref.actor.optim.optimizer_impl=dapo.muon \
+    actor_rollout_ref.actor.optim.optimizer_impl=src.muon \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \

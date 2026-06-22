@@ -67,7 +67,7 @@ actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
 infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
 offload=False
 
-python3 -m dapo.main_dapo \
+python3 -m src.main_dapo \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${VAL_FILES}" \
     data.prompt_key=prompt \

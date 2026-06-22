@@ -243,11 +243,11 @@ def build_optimizer(parameters, config: FSDPOptimizerConfig, module=None):
         config.optimizer = "AdamW8bit"
 
         # Muon (requires module for named_parameters access)
-        config.optimizer_impl = "dapo.muon"
+        config.optimizer_impl = "src.muon"
         config.optimizer = "Muon"
     """
     if config.optimizer == "Muon":
-        from dapo.muon import Muon
+        from src.muon import Muon
 
         assert module is not None, "Muon optimizer requires module for named_parameters access"
         muon_params = [
