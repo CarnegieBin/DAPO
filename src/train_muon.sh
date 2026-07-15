@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-# ExpThink hyperparameters
-expthink_alpha=0          # tolerance rate around historical minimum length
-expthink_r_pen=0.5          # discounted reward for correct-but-long responses
-expthink_l_max=16384        # initial buffer value (max token length)
-expthink_batch=true         # true: per-batch buffer (needs reward.num_workers=1); false: global buffer
+# Debug: surface the real root cause of vLLM EngineCore init failures
+export HYDRA_FULL_ERROR=1
+export VLLM_LOGGING_LEVEL=DEBUG
 
+# Restrict training to GPUs 4-7 (avoid GPU 0 used by others). Override externally if needed.
+# export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-4,5,6,7}
+
+optimizer=Muon
 project_name='DAPO'
-exp_name="DeepSeek-R1-Distill-Qwen-1.5B-Muon-alpha${expthink_alpha}-rpen${expthink_r_pen}"
+exp_name="DeepSeek-R1-Distill-Qwen-7B-${optimizer}"
 
 adv_estimator=grpo
 
@@ -21,15 +23,19 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 16))   # Lmax = 16384
+overlong_buffer_len=$((1024 * 4))    # Lcache = 4096 (soft penalty buffer)
+max_resp_len=$((1024 * 16))          # Lmax   = 16384 (penalty starts at Lmax - Lcache = 12288)
+max_response_length=$((max_resp_len + overlong_buffer_len))  # actual vLLM cap = 20480
+enable_overlong_buffer=True
+overlong_penalty_factor=1.0
 
 loss_agg_mode="token-mean"
 
 enable_filter_groups=True
 filter_groups_metric=acc
-max_num_gen_batches=10
+max_num_gen_batches=3
 train_prompt_bsz=512
-gen_prompt_bsz=$((256 * 3))          # 768
+gen_prompt_bsz=$((256 * 2))          # 768
 n_resp_per_prompt=16
 train_prompt_mini_bsz=128
 
@@ -40,7 +46,7 @@ NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_HOME="/home/work/tcbian/ExpThink/data"
-MODEL_PATH=${MODEL_PATH:-"/ssd2/llm_models/DeepSeek-R1-Distill-Qwen-1.5B"}
+MODEL_PATH=${MODEL_PATH:-"/ssd2/llm_models/DeepSeek-R1-Distill-Qwen-7B"}
 CKPTS_DIR=${CKPTS_DIR:-"/ssd1/tcbian/DAPO/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILE="${DATA_HOME}/deepscaler.parquet"
 # Multiple val files: aime_16, amc_8, math, minerva, olympiad
@@ -67,6 +73,9 @@ gen_tp=1
 use_dynamic_bsz=True
 actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
 infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
+# 7B trains in colocate mode with vLLM; offload FSDP params+optimizer to CPU
+# during training so vLLM has room to wake_up its KV cache afterwards (avoids
+# CUDA OOM at cumem_allocator wake_up). 1.5B fit without offload, 7B does not.
 offload=False
 
 python3 -m src.main_dapo \
@@ -100,11 +109,9 @@ python3 -m src.main_dapo \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.optim.optimizer=Muon \
-    actor_rollout_ref.actor.optim.optimizer_impl=src.custom_muon \
-    actor_rollout_ref.actor.optim.lr=5e-6 \
+    actor_rollout_ref.actor.optim.optimizer=${optimizer} \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
-    actor_rollout_ref.actor.optim.lr_scheduler_type=cosine \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.fsdp_config.param_offload=${offload} \
@@ -115,7 +122,7 @@ python3 -m src.main_dapo \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.75 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.max_num_batched_tokens=${infer_ppo_max_token_len} \
@@ -129,22 +136,20 @@ python3 -m src.main_dapo \
     actor_rollout_ref.rollout.val_kwargs.top_k=${val_top_k} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
+    actor_rollout_ref.rollout.val_kwargs.max_tokens=16384 \
     actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
-    reward.reward_manager.source=importlib \
-    reward.reward_manager.name=ExpThinkRewardManager \
-    reward.reward_manager.module.path=pkg://src.custom_reward_manager \
-    reward.reward_kwargs.expthink_alpha=${expthink_alpha} \
-    reward.reward_kwargs.expthink_r_pen=${expthink_r_pen} \
-    reward.reward_kwargs.expthink_l_max=${expthink_l_max} \
-    reward.reward_kwargs.expthink_batch=${expthink_batch} \
-    reward.num_workers=1 \
+    reward.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
+    reward.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
+    reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
+    reward.reward_kwargs.overlong_buffer_cfg.log=True \
+    reward.reward_kwargs.max_resp_len=${max_resp_len} \
     trainer.logger='["console","swanlab"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.n_gpus_per_node=${NGPUS_PER_NODE} \
     trainer.nnodes=${NNODES} \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.test_freq=10 \
     trainer.save_freq=10 \
     trainer.total_epochs=15 \

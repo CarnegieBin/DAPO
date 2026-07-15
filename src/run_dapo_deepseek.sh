@@ -1,4 +1,4 @@
-\#!/usr/bin/env bash
+#!/usr/bin/env bash
 set -xeuo pipefail
 
 # Debug: surface the real root cause of vLLM EngineCore init failures
