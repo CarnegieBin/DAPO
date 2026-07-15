@@ -28,12 +28,28 @@ from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device
 
-# Patch FSDPEngine._build_optimizer to support Muon.
-import src.custom_fsdp_engine  # noqa: F401
-
 
 class DAPOTaskRunner(TaskRunner):
     """TaskRunner that uses RayDAPOTrainer instead of RayPPOTrainer."""
+
+    def add_actor_rollout_worker(self, config):
+        """Register the DAPO worker so optimizer hooks run inside each Ray actor."""
+        from src.custom_worker import DAPOActorRolloutRefWorker
+        from verl.single_controller.ray import RayWorkerGroup
+        from verl.trainer.ppo.ray_trainer import Role
+
+        actor_rollout_cls = DAPOActorRolloutRefWorker
+        lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
+        if lora_rank <= 0:
+            lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
+        ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+        if need_reference_policy(config) and not ref_in_actor:
+            role = Role.ActorRolloutRef
+        else:
+            role = Role.ActorRollout
+        self.role_worker_mapping[role] = ray.remote(actor_rollout_cls)
+        self.mapping[role] = "global_pool"
+        return actor_rollout_cls, RayWorkerGroup
 
     def run(self, config):
         from pprint import pprint
