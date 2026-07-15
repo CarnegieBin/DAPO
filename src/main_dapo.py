@@ -28,6 +28,9 @@ from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device
 
+# Patch FSDPEngine._build_optimizer to support Muon.
+import src.custom_fsdp_engine  # noqa: F401
+
 
 class DAPOTaskRunner(TaskRunner):
     """TaskRunner that uses RayDAPOTrainer instead of RayPPOTrainer."""

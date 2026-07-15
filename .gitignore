@@ -131,3 +131,7 @@ logs
 log
 outputs
 .history
+
+# Claude Code local config
+.claude/nohup.out
+nohup.out

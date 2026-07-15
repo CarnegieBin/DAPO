@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
+# ExpThink hyperparameters
+expthink_alpha=0          # tolerance rate around historical minimum length
+expthink_r_pen=0.5          # discounted reward for correct-but-long responses
+expthink_l_max=16384        # initial buffer value (max token length)
+expthink_batch=true         # true: per-batch buffer (needs reward.num_workers=1); false: global buffer
+
 project_name='DAPO'
-exp_name='DAPO-DeepSeek-R1-Distill-Qwen-1.5B-Muon'
+exp_name="DeepSeek-R1-Distill-Qwen-1.5B-Muon-alpha${expthink_alpha}-rpen${expthink_r_pen}"
 
 adv_estimator=grpo
 
@@ -15,11 +21,7 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 max_prompt_length=$((1024 * 2))
-overlong_buffer_len=$((1024 * 4))    # Lcache = 4096 (soft penalty buffer)
-max_resp_len=$((1024 * 16))          # Lmax   = 16384 (penalty starts at Lmax - Lcache = 12288)
-max_response_length=$((max_resp_len + overlong_buffer_len))  # actual vLLM cap = 20480
-enable_overlong_buffer=True
-overlong_penalty_factor=1.0
+max_response_length=$((1024 * 16))   # Lmax = 16384
 
 loss_agg_mode="token-mean"
 
@@ -41,7 +43,10 @@ DATA_HOME="/home/work/tcbian/ExpThink/data"
 MODEL_PATH=${MODEL_PATH:-"/ssd2/llm_models/DeepSeek-R1-Distill-Qwen-1.5B"}
 CKPTS_DIR=${CKPTS_DIR:-"/ssd1/tcbian/DAPO/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILE="${DATA_HOME}/deepscaler.parquet"
+# Multiple val files: aime_16, amc_8, math, minerva, olympiad
 VAL_FILES="[${DATA_HOME}/aime_16.parquet,${DATA_HOME}/amc_8.parquet,${DATA_HOME}/math.parquet,${DATA_HOME}/minerva.parquet,${DATA_HOME}/olympiad.parquet]"
+# VAL_FILES="[${DATA_HOME}/aime_16.parquet]"
+
 
 # Logging
 LOG_FILE="$(pwd)/${project_name}-${exp_name}.log"
@@ -55,7 +60,8 @@ val_temperature=0.6
 val_top_p=0.95
 val_top_k=-1    # default
 
-# Performance
+# Performance: 1.5B model fits comfortably on single GPU, no need for parallelism or offload
+# max trajectory length per GPU = max_prompt_length + max_response_length = 2048 + 16384 = 18432
 sp_size=1
 gen_tp=1
 use_dynamic_bsz=True
@@ -95,9 +101,10 @@ python3 -m src.main_dapo \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.optimizer=Muon \
-    actor_rollout_ref.actor.optim.optimizer_impl=src.muon \
-    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.optim.optimizer_impl=src.custom_muon \
+    actor_rollout_ref.actor.optim.lr=5e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
+    actor_rollout_ref.actor.optim.lr_scheduler_type=cosine \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.fsdp_config.param_offload=${offload} \
@@ -108,7 +115,7 @@ python3 -m src.main_dapo \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.75 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.max_num_batched_tokens=${infer_ppo_max_token_len} \
@@ -124,11 +131,14 @@ python3 -m src.main_dapo \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
-    reward.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
-    reward.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
-    reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
-    reward.reward_kwargs.overlong_buffer_cfg.log=True \
-    reward.reward_kwargs.max_resp_len=${max_resp_len} \
+    reward.reward_manager.source=importlib \
+    reward.reward_manager.name=ExpThinkRewardManager \
+    reward.reward_manager.module.path=pkg://src.custom_reward_manager \
+    reward.reward_kwargs.expthink_alpha=${expthink_alpha} \
+    reward.reward_kwargs.expthink_r_pen=${expthink_r_pen} \
+    reward.reward_kwargs.expthink_l_max=${expthink_l_max} \
+    reward.reward_kwargs.expthink_batch=${expthink_batch} \
+    reward.num_workers=1 \
     trainer.logger='["console","swanlab"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \

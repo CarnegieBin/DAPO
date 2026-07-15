@@ -66,7 +66,8 @@ def compute_score(solution_str, ground_truth, method="strict", format_score=0.0,
     if answer is None:
         return 0
     else:
-        if answer == ground_truth:
+        gt_list = ground_truth if isinstance(ground_truth, list) else [ground_truth]
+        if answer in gt_list:
             return score
         else:
             return format_score

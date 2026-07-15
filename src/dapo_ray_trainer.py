@@ -20,7 +20,6 @@ import glob as glob_module
 import json
 import os
 import shutil
-import time
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -61,7 +60,7 @@ class RayDAPOTrainer(RayPPOTrainer):
 
     def _init_trajectory_log_dir(self, resumed_from_step: int = 0):
         """
-        Initialize the trajectory log directory under <cwd>/log_data/<project>/<exp>/.
+        Initialize the trajectory log directory under <checkpoint_dir>/trajectories/.
 
         - resumed_from_step == 0: fresh start, wipe the entire directory if it exists.
         - resumed_from_step > 0:  recovering from a checkpoint at that step, keep
@@ -71,9 +70,7 @@ class RayDAPOTrainer(RayPPOTrainer):
           train/  -> one file per training step: step_{N:06d}.jsonl
           val/    -> one file per validation call: step_{N:06d}.jsonl
         """
-        project_name = self.config.trainer.project_name
-        exp_name = self.config.trainer.experiment_name
-        base_dir = os.path.join(os.getcwd(), "log_data", project_name, exp_name)
+        base_dir = os.path.join(self.config.trainer.default_local_dir, "trajectories")
 
         if resumed_from_step == 0:
             if os.path.exists(base_dir):
@@ -182,14 +179,26 @@ class RayDAPOTrainer(RayPPOTrainer):
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
 
-        # ---- Clean up old checkpoints: keep only HF weights ----
+
+        # ---- Convert old checkpoints to HF format, then prune shards ----
+        # For every checkpoint older than the one we just saved:
+        #   1. If huggingface/ has no HF weights but FSDP shards exist, merge shards -> HF.
+        #      (Old checkpoints saved before hf_model was enabled only contain shards.)
+        #   2. Once HF weights are present, delete the FSDP shards (model/optimizer/extra)
+        #      and the dataloader state, keeping only the HF weights.
         for ckpt_dir in glob_module.glob(
             os.path.join(self.config.trainer.default_local_dir, "global_step_*")
         ):
             if os.path.basename(ckpt_dir) == f"global_step_{self.global_steps}":
                 continue  # skip the checkpoint we just saved
 
-            # Remove dataloader state
+            for role in ["actor", "critic"]:
+                role_dir = os.path.join(ckpt_dir, role)
+                if not os.path.isdir(role_dir):
+                    continue
+                self._ensure_hf_then_prune_shards(role_dir)
+
+            # Remove dataloader state (only after role dirs are handled)
             data_pt = os.path.join(ckpt_dir, "data.pt")
             if os.path.exists(data_pt):
                 try:
@@ -198,96 +207,71 @@ class RayDAPOTrainer(RayPPOTrainer):
                 except Exception as e:
                     print(f"Failed to remove {data_pt}: {e}")
 
-            for role in ["actor", "critic"]:
-                role_dir = os.path.join(ckpt_dir, role)
-                if not os.path.isdir(role_dir):
-                    continue
-                hf_dir = os.path.join(role_dir, "huggingface")
-                if not os.path.isdir(hf_dir):
-                    print(f"Warning: {role_dir} has no huggingface/ subdir, skipping cleanup")
-                    continue
-                # Delete everything inside role_dir except huggingface/
-                for item in os.listdir(role_dir):
-                    if item == "huggingface":
-                        continue
-                    item_path = os.path.join(role_dir, item)
-                    try:
-                        if os.path.isdir(item_path):
-                            shutil.rmtree(item_path)
-                        else:
-                            os.remove(item_path)
-                        print(f"Removed old non-HF file: {item_path}")
-                    except Exception as e:
-                        print(f"Failed to remove {item_path}: {e}")
+    def _ensure_hf_then_prune_shards(self, role_dir: str):
+        """Ensure HF weights exist under role_dir/huggingface, then delete FSDP shards.
 
-    def _record_and_prune_checkpoints(self, val_metrics: dict, keep_best: int = 3):
-        """Keep only the best `keep_best` checkpoints (ranked by AIME pass@1) plus the
-        current step's checkpoint; delete all others entirely.
-
-        Called after validation so the current step's pass@1 is available. The metric
-        history is persisted to `checkpoint_metrics.json` under default_local_dir so
-        rankings survive a resume.
+        If HF weights are missing but FSDP shards are present, merge the shards into
+        HF format first (handles old checkpoints saved before hf_model was enabled).
+        Shards are only deleted once HF weights are confirmed present, to avoid losing
+        the only copy of the weights.
         """
-        ckpt_root = self.config.trainer.default_local_dir
-        cur_step = self.global_steps
-        cur_dir = os.path.join(ckpt_root, f"global_step_{cur_step}")
-        if not os.path.isdir(cur_dir):
-            return  # no checkpoint saved this step, nothing to prune
-
-        # Extract AIME pass@1 from val metrics (data_source containing "aime").
-        aime_score = None
-        for k, v in val_metrics.items():
-            kl = k.lower()
-            if kl.startswith("val-core/") and "aime" in kl and kl.endswith("/pass_k/pass@1"):
-                aime_score = float(v)
-                break
-        if aime_score is None:
-            print("[CkptPrune] No AIME pass@1 found in val metrics; skipping prune this step.")
+        hf_dir = os.path.join(role_dir, "huggingface")
+        if not os.path.isdir(hf_dir):
+            print(f"Warning: {role_dir} has no huggingface/ subdir, skipping cleanup")
             return
 
-        hist_path = os.path.join(ckpt_root, "checkpoint_metrics.json")
-        history = {}
-        if os.path.exists(hist_path):
-            try:
-                with open(hist_path) as f:
-                    history = json.load(f)
-            except Exception:
-                history = {}
-        history[str(cur_step)] = aime_score
+        def hf_weights_exist() -> bool:
+            return bool(
+                glob_module.glob(os.path.join(hf_dir, "*.safetensors"))
+                or glob_module.glob(os.path.join(hf_dir, "pytorch_model*.bin"))
+            )
 
-        # Collect existing checkpoint steps on disk.
-        existing_steps = []
-        for d in glob_module.glob(os.path.join(ckpt_root, "global_step_*")):
-            if not os.path.isdir(d):
-                continue
+        # Step 1: merge shards -> HF if HF weights are missing
+        if not hf_weights_exist():
+            fsdp_config = os.path.join(role_dir, "fsdp_config.json")
+            has_shards = bool(glob_module.glob(os.path.join(role_dir, "model_world_size_*.pt")))
+            if not (os.path.exists(fsdp_config) and has_shards):
+                print(
+                    f"Warning: {role_dir} has neither HF weights nor mergeable FSDP shards "
+                    f"(need fsdp_config.json + model_world_size_*.pt), skipping cleanup"
+                )
+                return
             try:
-                existing_steps.append(int(os.path.basename(d).replace("global_step_", "")))
-            except ValueError:
-                continue
+                from verl.model_merger.base_model_merger import ModelMergerConfig
+                from verl.model_merger.fsdp_model_merger import FSDPModelMerger
 
-        # Keep the top `keep_best` by AIME pass@1, plus the current step.
-        ranked = sorted(existing_steps, key=lambda s: history.get(str(s), float("-inf")), reverse=True)
-        keep = set(ranked[:keep_best])
-        keep.add(cur_step)
-
-        for s in existing_steps:
-            if s in keep:
-                continue
-            d = os.path.join(ckpt_root, f"global_step_{s}")
-            try:
-                shutil.rmtree(d)
-                print(f"[CkptPrune] Removed checkpoint not in best-{keep_best}+current: {d}")
+                merger_config = ModelMergerConfig(
+                    operation="merge",
+                    backend="fsdp",
+                    target_dir=hf_dir,
+                    local_dir=role_dir,
+                    hf_model_config_path=hf_dir,
+                    trust_remote_code=self.config.actor_rollout_ref.model.get("trust_remote_code", False),
+                )
+                print(f"Merging FSDP shards to HF format: {role_dir} -> {hf_dir}")
+                merger = FSDPModelMerger(merger_config)
+                merger.merge_and_save()
+                merger.cleanup()
             except Exception as e:
-                print(f"[CkptPrune] Failed to remove {d}: {e}")
+                print(f"Failed to merge FSDP shards in {role_dir}: {e}; skipping cleanup to avoid weight loss")
+                return
 
-        history = {s: sc for s, sc in history.items() if int(s) in keep}
-        with open(hist_path, "w") as f:
-            json.dump(history, f, indent=2)
-        print(
-            f"[CkptPrune] Kept {sorted(keep)} "
-            f"(best-{keep_best} by AIME pass@1 + current step {cur_step}); "
-            f"current pass@1={aime_score:.4f}"
-        )
+        # Step 2: prune shards now that HF weights are present
+        if not hf_weights_exist():
+            print(f"Warning: {hf_dir} still has no HF weights after merge attempt, skipping cleanup")
+            return
+        for item in os.listdir(role_dir):
+            if item == "huggingface":
+                continue
+            item_path = os.path.join(role_dir, item)
+            try:
+                if os.path.isdir(item_path):
+                    shutil.rmtree(item_path)
+                else:
+                    os.remove(item_path)
+                print(f"Removed old non-HF file: {item_path}")
+            except Exception as e:
+                print(f"Failed to remove {item_path}: {e}")
 
     def compute_kl_related_metrics(self, batch: DataProto, metrics: dict, timing_raw: dict):
         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -547,9 +531,6 @@ class RayDAPOTrainer(RayPPOTrainer):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
 
-                _step_start_ts = time.time()
-                print(f"[FIT] === step={self.global_steps} epoch={epoch} | loop-top reached ===", flush=True)
-
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
                         not prev_step_profile and curr_step_profile
@@ -570,13 +551,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, "red"):
-                        print(f"[FIT] step={self.global_steps} gen_batch={num_gen_batches} | "
-                              f"calling generate_sequences ...", flush=True)
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
-                        print(f"[FIT] step={self.global_steps} gen_batch={num_gen_batches} | "
-                              f"generate_sequences done, elapsed={time.time()-_step_start_ts:.1f}s", flush=True)
 
                     # Decode training inputs/outputs now; scores appended after reward computation
                     try:
@@ -632,8 +609,6 @@ class RayDAPOTrainer(RayPPOTrainer):
                         # otherwise, we will compute those after dynamic sampling
 
                     with marked_timer("reward", timing_raw, "yellow"):
-                        print(f"[FIT] step={self.global_steps} gen_batch={num_gen_batches} | "
-                              f"computing reward ...", flush=True)
                         # compute scores. Support both model and function-based.
                         # We first compute the scores using reward model. Then, we call reward_fn to combine
                         # the results from reward model and rule-based results.
@@ -787,8 +762,6 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                         prompt_bsz = self.config.data.train_batch_size
                         if num_prompt_in_batch < prompt_bsz:
-                            print(f"[FIT] step={self.global_steps} gen_batch={num_gen_batches} | "
-                                  f"{num_prompt_in_batch=} < {prompt_bsz=}, need more generations", flush=True)
                             print(f"{num_prompt_in_batch=} < {prompt_bsz=}")
                             max_num_gen_batches = self.config.algorithm.filter_groups.max_num_gen_batches
                             if max_num_gen_batches <= 0 or num_gen_batches < max_num_gen_batches:
@@ -830,10 +803,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                             print(f"[TrajectoryLog] Warning: failed to flush train trajectories at step "
                                   f"{self.global_steps}: {_e}")
 
-                    print(f"[FIT] step={self.global_steps} | calling sleep_replicas ...", flush=True)
                     self.checkpoint_manager.sleep_replicas()
-                    print(f"[FIT] step={self.global_steps} | sleep_replicas done, "
-                          f"elapsed={time.time()-_step_start_ts:.1f}s", flush=True)
 
                     # === Updating ===
                     # Balance the number of valid tokens across DP ranks.
@@ -848,10 +818,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
                     if not self.config.algorithm.use_kl_in_reward:
-                        print(f"[FIT] step={self.global_steps} | computing kl_related_metrics ...", flush=True)
                         batch = self.compute_kl_related_metrics(batch, metrics, timing_raw)
-                        print(f"[FIT] step={self.global_steps} | kl_related_metrics done, "
-                              f"elapsed={time.time()-_step_start_ts:.1f}s", flush=True)
 
                     # compute values
                     if self.use_critic:
@@ -892,10 +859,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, "red"):
-                            print(f"[FIT] step={self.global_steps} | calling update_actor ...", flush=True)
                             actor_output = self._update_actor(batch)
-                            print(f"[FIT] step={self.global_steps} | update_actor done, "
-                                  f"elapsed={time.time()-_step_start_ts:.1f}s", flush=True)
 
                         # Check if ESI/training plan is close to expiration
                         esi_close_to_expiration = should_save_ckpt_esi(
@@ -913,10 +877,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                                 self._save_checkpoint()
 
                         with marked_timer("update_weights", timing_raw, "red"):
-                            print(f"[FIT] step={self.global_steps} | calling update_weights ...", flush=True)
                             self.checkpoint_manager.update_weights()
-                            print(f"[FIT] step={self.global_steps} | update_weights done, "
-                                  f"elapsed={time.time()-_step_start_ts:.1f}s", flush=True)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
@@ -930,16 +891,10 @@ class RayDAPOTrainer(RayPPOTrainer):
                     is_last_step or self.global_steps % self.config.trainer.test_freq == 0
                 ):
                     with marked_timer("testing", timing_raw, "green"):
-                        print(f"[FIT] step={self.global_steps} | starting validation ...", flush=True)
                         val_metrics: dict = self._validate()
-                        print(f"[FIT] step={self.global_steps} | validation done, "
-                              f"elapsed={time.time()-_step_start_ts:.1f}s", flush=True)
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
-
-                    # Keep only the best-3 checkpoints by AIME pass@1 plus the current one.
-                    self._record_and_prune_checkpoints(val_metrics, keep_best=3)
 
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (

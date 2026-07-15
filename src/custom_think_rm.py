@@ -19,7 +19,7 @@ def mathd_normalize_answer(answer: Optional[str]) -> Optional[str]:
     answer = answer.strip()
     try:
         # Remove enclosing `\text{}`.
-        m = re.search("^\\\\text\{(?P<text>.+?)\}$", answer)
+        m = re.search(r"^\\text\{(?P<text>.+?)\}$", answer)
         if m is not None:
             answer = m.group("text").strip()
         return _strip_string(answer)
@@ -131,7 +131,7 @@ def _strip_string(string):
 
     # remove percentage
     string = string.replace("\\%", "")
-    string = string.replace("\%", "")
+    string = string.replace("\\%", "")
 
     # " 0." equivalent to " ." and "{0." equivalent to "{." Alternatively, add "0" if "." is the start of the string
     string = string.replace(" .", " 0.")
@@ -168,7 +168,7 @@ def _strip_string(string):
 
 # sympy might hang -- we don't care about trying to be lenient in these cases
 BAD_SUBSTRINGS = ["^{", "^("]
-BAD_REGEXES = ["\^[0-9]+\^", "\^[0-9][0-9]+"]
+BAD_REGEXES = [r"\^[0-9]+\^", r"\^[0-9][0-9]+"]
 TUPLE_CHARS = "()[]"
 
 
@@ -184,11 +184,58 @@ def _sympy_parse(expr: str):
     )
 
 
+def _convert_frac(expr: str) -> str:
+    """Convert \\frac{X}{Y} to (X)/(Y) manually to avoid pylatexenc failures."""
+    while "\\frac" in expr:
+        idx = expr.find("\\frac")
+        # find the first '{' after \frac
+        i = idx + len("\\frac")
+        # skip optional space
+        while i < len(expr) and expr[i] == ' ':
+            i += 1
+        if i >= len(expr) or expr[i] != '{':
+            break
+        # match first brace group (numerator)
+        depth, start = 0, i
+        while i < len(expr):
+            if expr[i] == '{':
+                depth += 1
+            elif expr[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        if depth != 0:
+            break
+        numerator = expr[start + 1:i]
+        i += 1
+        # skip optional space
+        while i < len(expr) and expr[i] == ' ':
+            i += 1
+        if i >= len(expr) or expr[i] != '{':
+            break
+        # match second brace group (denominator)
+        depth, start2 = 0, i
+        while i < len(expr):
+            if expr[i] == '{':
+                depth += 1
+            elif expr[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        if depth != 0:
+            break
+        denominator = expr[start2 + 1:i]
+        expr = expr[:idx] + f"({numerator})/({denominator})" + expr[i + 1:]
+    return expr
+
+
 def _parse_latex(expr: str) -> str:
     """Attempts to parse latex to an expression sympy can read."""
     expr = expr.replace("\\tfrac", "\\frac")
     expr = expr.replace("\\dfrac", "\\frac")
-    expr = expr.replace("\\frac", " \\frac")  # Play nice with mixed numbers.
+    expr = _convert_frac(expr)
     expr = latex2text.LatexNodes2Text().latex_to_text(expr)
 
     # Replace the specific characters that this parser uses.
@@ -248,7 +295,7 @@ def _inject_implicit_mixed_number(step: str):
 
 def _strip_properly_formatted_commas(expr: str):
     # We want to be careful because we don't want to strip tuple commas
-    p1 = re.compile("(\d)(,)(\d\d\d)($|\D)")
+    p1 = re.compile(r"(\d)(,)(\d\d\d)($|\D)")
     while True:
         next_expr = p1.sub("\\1\\3\\4", expr)
         if next_expr == expr:
@@ -263,7 +310,7 @@ def _normalize(expr: str) -> str:
         return None
 
     # Remove enclosing `\text{}`.
-    m = re.search("^\\\\text\{(?P<text>.+?)\}$", expr)
+    m = re.search(r"^\\text\{(?P<text>.+?)\}$", expr)
     if m is not None:
         expr = m.group("text")
 
@@ -296,8 +343,8 @@ def _normalize(expr: str) -> str:
         "inch",
         "yard",
     ]:
-        expr = re.sub(f"{unit}(es)?(s)? *(\^[0-9]+)?", "", expr)
-    expr = re.sub(f"\^ *\\\\circ", "", expr)
+        expr = re.sub(rf"{unit}(es)?(s)? *(\^[0-9]+)?", "", expr)
+    expr = re.sub(r"\^ *\\circ", "", expr)
 
     if len(expr) > 0 and expr[0] == "{" and expr[-1] == "}":
         expr = expr[1:-1]

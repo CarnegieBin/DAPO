@@ -42,7 +42,7 @@ This recipe integrates [TransferQueue](https://github.com/TransferQueue/Transfer
 **主配置 / Main config:**
 
 ```bash
-python3 -m dapo.dapo_transfer_queue.main_dapo \
+python3 -m src.dapo_transfer_queue.main_dapo \
   --config-name=dapo_transfer_queue_trainer \
   data.train_files=... \
   data.val_files=... \
@@ -53,7 +53,7 @@ python3 -m dapo.dapo_transfer_queue.main_dapo \
 **快速开始 / Quickstart (少量 step、仅 console / few steps, console only):**
 
 ```bash
-python3 -m dapo.dapo_transfer_queue.main_dapo \
+python3 -m src.dapo_transfer_queue.main_dapo \
   --config-name=dapo_transfer_queue_quickstart \
   data.train_files=... \
   data.val_files=... \

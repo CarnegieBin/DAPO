@@ -20,6 +20,15 @@ reward:
       log: True
     max_resp_len: 16384   # Lmax: expected max response length (tokens)
 
+actor_rollout_ref:
+  actor:
+    checkpoint:
+      # Save full HuggingFace-format weights under each checkpoint's huggingface/ dir,
+      # in addition to FSDP shards (model/optimizer/extra) needed for resume.
+      # Old checkpoints get their shards pruned (keeping only HF weights) in _save_checkpoint.
+      save_contents: ['model', 'optimizer', 'extra', 'hf_model']
+      load_contents: ['model', 'optimizer', 'extra']
+
 algorithm:
   filter_groups:
     _target_: verl.trainer.config.FilterGroupsConfig

@@ -2,37 +2,90 @@ import math
 import torch
 
 
-# This code snippet is a modified version adapted from the following GitHub repository:
-# https://github.com/KellerJordan/Muon/blob/master/muon.py
+# Polar Express coefficients from https://arxiv.org/pdf/2505.16932
+_POLAR_EXPRESS_RAW = [
+    (8.28721201814563, -23.595886519098837, 17.300387312530933),
+    (4.107059111542203, -2.9478499167379106, 0.5448431082926601),
+    (3.9486908534822946, -2.908902115962949, 0.5518191394370137),
+    (3.3184196573706015, -2.488488024314874, 0.51004894012372),
+    (2.300652019954817, -1.6689039845747493, 0.4188073119525673),
+]
+_SAFETY = 1.05
+POLAR_EXPRESS_COEFFICIENTS = [
+    (a / _SAFETY, b / _SAFETY**3, c / _SAFETY**5)
+    for (a, b, c) in _POLAR_EXPRESS_RAW
+]
+
+
 @torch.compile
-def zeropower_via_newtonschulz5(G, steps):
+def gram_newton_schulz(G, steps=5):
     """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
-    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
-    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
-    zero even beyond the point where the iteration no longer converges all the way to one everywhere
-    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
-    performance at all relative to UV^T, where USV^T = G is the SVD.
+    Gram Newton-Schulz: operates on the n×n Gram matrix instead of n×m,
+    with a restart after iteration 2 for numerical stability in float16.
+    Reference: https://dao-lab.ai/blog/2026/gram-newton-schulz/
     """
     assert len(G.shape) == 2
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
-    if G.size(0) > G.size(1):
+    X = G.float()
+    if X.size(0) > X.size(1):
         X = X.T
-    # Ensure spectral norm is at most 1
     X = X / (X.norm() + 1e-7)
-    # Perform the NS iterations
-    for _ in range(steps):
-        A = X @ X.T
-        B = (
-            b * A + c * A @ A
-        )  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
+    X = X.half()
+
+    coeffs = POLAR_EXPRESS_COEFFICIENTS[:steps]
+    n = X.size(0)
+    I = torch.eye(n, device=X.device, dtype=X.dtype)
+    R = X @ X.mT
+    Q = None
+
+    for i, (a, b, c) in enumerate(coeffs):
+        if i == 2 and Q is not None:
+            X = Q @ X
+            R = X @ X.mT
+            Q = None
+
+        Z = torch.baddbmm(R, R, R, beta=b, alpha=c)
+        if Q is None:
+            Q = Z + a * I
+        else:
+            Q = torch.baddbmm(Q, Q, Z, beta=a, alpha=1.0)
+        if i < len(coeffs) - 1 and (i + 1) != 2:
+            RZ = torch.baddbmm(R, R, Z, beta=a, alpha=1.0)
+            R = torch.baddbmm(RZ, Z, RZ, beta=a, alpha=1.0)
+
+    X = Q @ X
 
     if G.size(0) > G.size(1):
         X = X.T
     return X
+
+
+# =============================================================================
+# H100/H800 (Hopper, SM90) 版本 — 使用 Quack 库的自定义对称 GEMM kernel
+# 相比纯 cuBLAS 版本额外提速 ~25-30%（对称矩阵只计算下三角 + 转置写入上三角）
+# 需要: pip install quack (https://github.com/Dao-AILab/quack)
+# 硬件要求: NVIDIA Hopper (H100/H800) 或 Blackwell 架构，不兼容 Ampere (A100/A800)
+# =============================================================================
+#
+# from gram_newton_schulz import GramNewtonSchulz, POLAR_EXPRESS_COEFFICIENTS
+#
+# # 初始化（仅需一次，ns_use_kernels=True 启用 Quack 对称 GEMM kernel）
+# _gram_ns_hopper = GramNewtonSchulz(
+#     ns_coefficients=POLAR_EXPRESS_COEFFICIENTS,
+#     ns_use_kernels=True,  # 启用 CuTeDSL 对称 GEMM kernel (Hopper/Blackwell only)
+#     gram_newton_schulz_reset_iterations=[2],
+#     compile_kwargs={"fullgraph": True, "mode": "reduce-overhead"},
+# )
+#
+# def gram_newton_schulz_hopper(G, steps=5):
+#     """
+#     H100/Hopper 专用版本，利用 Quack 对称 GEMM kernel 获得额外加速。
+#     对比纯 PyTorch 版本:
+#       - 对称 GEMM 只计算下三角，FLOP 减半
+#       - 利用 Hopper TMA/Cluster/Ping-Pong Scheduling 硬件特性
+#       - 矩阵尺寸 > 256 时自动启用 kernel，否则 fallback 到 cuBLAS
+#     在 Kimi K2 配置下 (384 experts, hidden=7168) 比标准 NS 快 2x。
+#     """
+#     return _gram_ns_hopper(G)
 
 
 class Muon(torch.optim.Optimizer):
@@ -89,12 +142,11 @@ class Muon(torch.optim.Optimizer):
         adamw_params = list(adamw_params) if adamw_params is not None else []
         params.extend(adamw_params)
         super().__init__(params, defaults)
-        # Sort parameters into those for which we will use Muon, and those for which we will not
+        # Store muon param ids separately so FSDP state offload/reload won't lose them
+        self._muon_param_ids = set()
         for p in muon_params:
             assert p.ndim == 2, p.ndim
-            self.state[p]["use_muon"] = True
-        for p in adamw_params:
-            self.state[p]["use_muon"] = False
+            self._muon_param_ids.add(id(p))
 
     def adjust_lr_for_muon(self, lr, param_shape):
         A, B = param_shape[:2]
@@ -114,7 +166,7 @@ class Muon(torch.optim.Optimizer):
             #           Muon           #
             ############################
 
-            params = [p for p in group["params"] if self.state[p]["use_muon"]]
+            params = [p for p in group["params"] if id(p) in self._muon_param_ids]
             lr = group["lr"]
             wd = group["wd"]
             momentum = group["momentum"]
@@ -136,7 +188,7 @@ class Muon(torch.optim.Optimizer):
                     g = g.add(buf, alpha=momentum)
                 else:
                     g = buf
-                u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+                u = gram_newton_schulz(g, steps=group["ns_steps"])
 
                 adjusted_lr = self.adjust_lr_for_muon(lr, p.shape)
 
@@ -147,7 +199,7 @@ class Muon(torch.optim.Optimizer):
             #       AdamW backup       #
             ############################
 
-            params = [p for p in group["params"] if not self.state[p]["use_muon"]]
+            params = [p for p in group["params"] if id(p) not in self._muon_param_ids]
             lr = group['lr']
             beta1, beta2 = group["adamw_betas"]
             eps = group["adamw_eps"]

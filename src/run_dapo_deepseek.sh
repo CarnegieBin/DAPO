@@ -1,8 +1,15 @@
-#!/usr/bin/env bash
+\#!/usr/bin/env bash
 set -xeuo pipefail
 
+# Debug: surface the real root cause of vLLM EngineCore init failures
+export HYDRA_FULL_ERROR=1
+export VLLM_LOGGING_LEVEL=DEBUG
+
+# Restrict training to GPUs 4-7 (avoid GPU 0 used by others). Override externally if needed.
+# export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-4,5,6,7}
+
 project_name='DAPO'
-exp_name='DAPO-DeepSeek-R1-Distill-Qwen-7B'
+exp_name='DeepSeek-R1-Distill-Qwen-7B'
 
 adv_estimator=grpo
 
@@ -25,9 +32,9 @@ loss_agg_mode="token-mean"
 
 enable_filter_groups=True
 filter_groups_metric=acc
-max_num_gen_batches=10
+max_num_gen_batches=3
 train_prompt_bsz=512
-gen_prompt_bsz=$((256 * 3))          # 768
+gen_prompt_bsz=$((256 * 2))          # 768
 n_resp_per_prompt=16
 train_prompt_mini_bsz=128
 
@@ -58,13 +65,16 @@ val_temperature=0.6
 val_top_p=0.95
 val_top_k=-1    # default
 
-# Performance: 7B model. Single GPU per rank still fits with gradient checkpointing.
+# Performance: 1.5B model fits comfortably on single GPU, no need for parallelism or offload
 # max trajectory length per GPU = max_prompt_length + max_response_length = 2048 + 16384 = 18432
 sp_size=1
 gen_tp=1
 use_dynamic_bsz=True
 actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
 infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
+# 7B trains in colocate mode with vLLM; offload FSDP params+optimizer to CPU
+# during training so vLLM has room to wake_up its KV cache afterwards (avoids
+# CUDA OOM at cumem_allocator wake_up). 1.5B fit without offload, 7B does not.
 offload=False
 
 python3 -m src.main_dapo \
@@ -98,8 +108,6 @@ python3 -m src.main_dapo \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.checkpoint.save_contents=[model,hf_model] \
-    actor_rollout_ref.actor.checkpoint.load_contents=[model] \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
@@ -112,7 +120,7 @@ python3 -m src.main_dapo \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.max_num_batched_tokens=${infer_ppo_max_token_len} \
@@ -126,6 +134,7 @@ python3 -m src.main_dapo \
     actor_rollout_ref.rollout.val_kwargs.top_k=${val_top_k} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
+    actor_rollout_ref.rollout.val_kwargs.max_tokens=16384 \
     actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     reward.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
@@ -138,7 +147,7 @@ python3 -m src.main_dapo \
     trainer.experiment_name="${exp_name}" \
     trainer.n_gpus_per_node=${NGPUS_PER_NODE} \
     trainer.nnodes=${NNODES} \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.test_freq=10 \
     trainer.save_freq=10 \
     trainer.total_epochs=15 \

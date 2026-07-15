@@ -56,10 +56,19 @@ def _verify_in_subprocess(ground_truth_boxed: str, model_output: str) -> float:
 
 def compute_score(model_output: str, ground_truth: str, timeout_score: float = 0, timeout: float = 30.0) -> float:
     ret_score = 0.0
-    ground_truth_boxed = "\\boxed{" + ground_truth + "}"
+    if isinstance(ground_truth, list):
+        ground_truth_boxed_list = ["\\boxed{" + g + "}" for g in ground_truth]
+    else:
+        ground_truth_boxed_list = ["\\boxed{" + ground_truth + "}"]
     try:
-        future = _get_pool().submit(_verify_in_subprocess, ground_truth_boxed, model_output)
-        ret_score = future.result(timeout=timeout)
+        for ground_truth_boxed in ground_truth_boxed_list:
+            future = _get_pool().submit(_verify_in_subprocess, ground_truth_boxed, model_output)
+            try:
+                ret_score = future.result(timeout=timeout)
+            except (FuturesTimeoutError, TimeoutException):
+                ret_score = timeout_score
+            if ret_score > 0:
+                return ret_score
     except (FuturesTimeoutError, TimeoutException):
         ret_score = timeout_score
     except Exception as e:
